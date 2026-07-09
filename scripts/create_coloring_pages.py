@@ -52,34 +52,59 @@ def _alpha_outline(rgba: Image.Image, thickness: int = 3) -> np.ndarray:
     return cv2.subtract(binary, eroded)
 
 
-def _sketch_edges(gray: np.ndarray) -> np.ndarray:
-    inv = 255 - gray
-    blur = cv2.GaussianBlur(inv, (21, 21), 0)
-    sketch = cv2.divide(gray, 255 - blur, scale=256.0)
-    _, lines = cv2.threshold(sketch, 210, 255, cv2.THRESH_BINARY_INV)
-    return lines
+def _major_region_boundaries(rgb: np.ndarray, color_count: int = 4) -> np.ndarray:
+    """Boundaries between large color areas (eyes, patches) — not fur texture."""
+    h, w = rgb.shape[:2]
+    scale = 8
+    small = cv2.resize(rgb, (max(1, w // scale), max(1, h // scale)), interpolation=cv2.INTER_AREA)
+    blurred = cv2.GaussianBlur(small, (9, 9), 0)
+
+    pixels = blurred.reshape(-1, 3).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, _ = cv2.kmeans(
+        pixels, color_count, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels.reshape(small.shape[:2]).astype(np.uint8)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    boundaries = cv2.morphologyEx(labels, cv2.MORPH_GRADIENT, kernel)
+    boundaries = (boundaries > 0).astype(np.uint8) * 255
+
+    boundaries = cv2.resize(boundaries, (w, h), interpolation=cv2.INTER_NEAREST)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    boundaries = cv2.morphologyEx(boundaries, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    return boundaries
+
+
+def _remove_fine_details(binary: np.ndarray, min_area: int) -> np.ndarray:
+    """Drop small scattered strokes (fur, shading noise)."""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    for label in range(1, num_labels):
+        if stats[label, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == label] = 255
+    return cleaned
 
 
 def _extract_line_art(rgba: Image.Image, rgb: np.ndarray, line_strength: int = 3) -> np.ndarray:
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+    h, w = rgb.shape[:2]
+    min_area = max(250, int(h * w * 0.0008))
 
-    median = float(np.median(blurred))
-    lower = int(max(30, 0.55 * median))
-    upper = int(min(255, 1.25 * median))
-    canny = cv2.Canny(blurred, lower, upper)
-
-    sketch = _sketch_edges(gray)
     outline = _alpha_outline(rgba, thickness=max(2, line_strength))
-    combined = cv2.bitwise_or(canny, sketch)
-    combined = cv2.bitwise_or(combined, outline)
+    regions = _major_region_boundaries(rgb, color_count=4)
+
+    alpha_mask = np.array(rgba.split()[-1]) > 16
+    regions = regions.copy()
+    regions[~alpha_mask] = 0
+
+    combined = cv2.bitwise_or(outline, regions)
+    combined = _remove_fine_details(combined, min_area)
 
     kernel_size = max(1, line_strength)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     thickened = cv2.dilate(combined, kernel, iterations=1)
-    closed = cv2.morphologyEx(thickened, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    return 255 - closed
+    return 255 - thickened
 
 
 def _fit_on_canvas(
